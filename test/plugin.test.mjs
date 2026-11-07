@@ -1332,3 +1332,49 @@ test('T365 卡样本必须带 signalPreview（没有信号就无法审计"这张
   assert.ok(src.includes("signalPreview: String(lastUserText(payload?.messages) ?? '').slice(0, 160)"),
     '信号必须来自 lastUserText(payload.messages)（外层作用域），不能用 decidePreStep 的局部 text');
 });
+
+// ---------------------------------------------------------------------------
+// T3 ⑪ · 三级交付**接进生产链路**（wiring）
+//
+// 判据只有一份（`src/rooms/inject.mjs` 的 `isPointerCandidate`），"能不能生效"由插件配置决定。
+// 这一条钉住**唯一接线点**（`decidePreStep` 里的 `pointerTier: config.pointerTier === true`）：
+// 删掉那一行 ⇒ 配置键静默失效 ⇒ 两条断言互换 ⇒ 本测试红（tombstone）。
+// ---------------------------------------------------------------------------
+test('T3 ⑪ 接线: 配置 pointerTier 真的走到卡片上（true ⇒ 指针行；false ⇒ 逐字原文）', async () => {
+  const { workspace, storeRoot, cleanup } = makeWorkspace();
+  try {
+    /** 跑一次 pre-step，返回真正注入的那条消息的正文。 */
+    const injectedTextOf = async (over) => {
+      const { ctx, hooks } = makeCtx();
+      const { session } = makeSession(workspace);
+      apply(ctx, baseConfig({ storeRoot, ...over }));
+      const claimed = [userMessage('yaml 装不上')];
+      const out = await runHook({ hooks, payload: { agent: { session }, messages: claimed }, decision: enterDecision([...claimed]) });
+      assert.equal(out.messages.length, 2, '有命中就必须注入（否则这条测试什么都没测到）');
+      return messageText(out.messages[1]);
+    };
+
+    // 显式关：卡片给逐字原文（0.8.46 行为）
+    const off = await injectedTextOf({ pointerTier: false, probeValidity: false });
+    assert.ok(off.includes('Error: boom'), `显式关 ⇒ 给逐字原文：${off}`);
+    assert.ok(!off.includes('原文未给'), `显式关时一个字都不许变：${off}`);
+
+    // 显式开：同一批输入只剩坐标（episode + seq + 日期）
+    const on = await injectedTextOf({ pointerTier: true, probeValidity: false });
+    assert.ok(on.includes('1 局支撑 · 原文未给'), `接线后 ⇒ 只给指针：${on}`);
+    assert.ok(!on.includes('Error: boom'), `指针行的断言正文不许进注入文本：${on}`);
+    assert.ok(on.includes('ep-aaaaaaa1'), '坐标（episode）不许省');
+    assert.ok(on.includes('seq 30'), '坐标（seq）不许省');
+    assert.ok(on.includes('2026-10-21'), '日期（occurredAt）不许省');
+    assert.ok(on.includes('<memory-ledger>'), '指针行仍是一张展开的卡（不是零注入）');
+  } finally {
+    cleanup();
+  }
+});
+
+test('T3 ⑪: sanitizeConfig 认 pointerTier（布尔键；类型不对退回默认，不静默接受垃圾）', () => {
+  assert.equal(sanitizeConfig({ pointerTier: false }).pointerTier, false, '显式关必须生效');
+  assert.equal(sanitizeConfig({ pointerTier: true }).pointerTier, true);
+  assert.equal(sanitizeConfig({ pointerTier: 'yes' }).pointerTier, DEFAULT_CONFIG.pointerTier, '类型不对 ⇒ 退回默认');
+  assert.equal(sanitizeConfig({}).pointerTier, DEFAULT_CONFIG.pointerTier, '未设置 ⇒ 默认值（单一来源）');
+});

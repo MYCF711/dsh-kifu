@@ -26,7 +26,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createStore } from '../src/rooms/persist.mjs';
 import { readFrames, parseEvents } from '../src/rooms/logread.mjs';
-import { formatCardDate, singleLine } from '../src/rooms/inject.mjs';
+import { POINTER_BODY_RE, formatCardDate, singleLine } from '../src/rooms/inject.mjs';
 
 /** 文字层默认窗口：实测「调用步 → 工具结果」的 seq 间隔直方为 0×9,2×9,3×2,4×30,5×11,6×6,8/9/10 各 1，
  *  取 ±3 会把一大批真引用判成 elsewhere（2026-11-04 audit-11 复核后定）。*/
@@ -67,6 +67,31 @@ export function parseCardLines(section) {
     out.push({ marker: m[1], text: m[2], episode: m[3], date: m[4].trim(), seq: Number(m[5]), falsifiableWhen: m[6] ? m[6].trim() : null });
   }
   return out;
+}
+
+/**
+ * T3 · **指针行的机械豁免**（A6 文字层）。
+ *
+ * 背景：三级交付（`content` / `pointers` / `abstain`）打开后，`observed` 且只有 1 局支撑的记忆
+ * **只给坐标**（`episode + seq + occurredAt`），正文位置写的是计数 `N 局支撑 · 原文未给`。
+ * 它**故意没有逐字正文** ⇒ 拿它回查事件原文必然记成 `notFound`（假红）。
+ *
+ * 判据（机械、可核；不是 `if (pointer) skip`）：
+ *   ① 卡片行的正文（先剥掉卡片模板装饰 `[跨项目]`）**逐字等于** `pointerBodyOf` 的唯一产出形态
+ *      —— `POINTER_BODY_RE` 与 `pointerBodyOf` 共用同一个尾段常量，产出的每个字都必须在判据里出现；
+ *      判据是「等于」不是「包含」：少一个字符、多一个字符都不豁免。
+ *   ② 该卡必须**自证**确有指针行：留样自带的 `row.pointerCount`（由 `appendCardSample` 从产出
+ *      `section` 的**同一张卡对象**写入）必须等于本卡解析出的指针行数；对不上 ⇒ `pointerMismatch`
+ *      （**fail-closed**：宁红，不静默跳过）。
+ *   ③ 豁免只针对**正文层**：episode / seq / 日期三件套照常核（见 `auditRows` 的日期层）。
+ *
+ * 计入方式与 `unreadable` / `unresolved` 一致：**不进 A6 分子，也不进分母**
+ * —— 它们是「没得核」，不是「核不过」。
+ */
+export function isPointerBody(text) {
+  // 卡片模板装饰：行首 `[跨项目] ` 由 `normalizeCardText` 剥；`renderEntryLine` 的跨作用域标记在正文尾部。
+  const body = normalizeCardText(text).replace(/\s*\[跨项目\]$/, '');
+  return POINTER_BODY_RE.test(body);
 }
 
 /** 只要 provenance（兼容旧口径：不要求行首 marker 形态也能抽到 (ep, date, seq)）。 */
@@ -241,6 +266,14 @@ export async function auditRows({ rows, episodes, loadEvents = null, window = DE
         verdicts.push({ ...base, verdict: 'unreadable', state: 'unreadable', nearestSeq: null, distance: null, dateVerdict: 'unreadable', eventDate: null });
         continue;
       }
+      const dateVerdict = checkDate({ refDate: ref.date, event: eventNearSeq(events, ref.seq) });
+      // T3 · 三级交付：指针行**故意没有逐字正文**（正文位置只有计数）⇒ 正文层单列 `pointer`，
+      // 既不进 A6 分子也不进分母（与 unreadable / unresolved 同类：**没得核**，不是核不过）。
+      // 坐标与日期**照常核**（豁免只针对正文层）；是否该豁免由 `isPointerBody` 一处判定。
+      if (isPointerBody(ref.text)) {
+        verdicts.push({ ...base, verdict: 'pointer', state: 'pointer', nearestSeq: null, distance: null, claimId: null, textTrace: 'skipped', dateVerdict: dateVerdict.verdict, eventDate: dateVerdict.eventDate });
+        continue;
+      }
       // 信息项（不参与 A6）：渲染正文的旧检查 —— 仍有用（能发现"命中处是另一张被注入过的卡"）。
       const textTrace = ref.text ? classifyTextByEvents({ text: ref.text, seq: ref.seq, events, window }).verdict : 'skipped';
       // T243 主判据：用 claim 的 support.quote 去核原文（窗口 ±4）
@@ -279,10 +312,25 @@ export async function auditRows({ rows, episodes, loadEvents = null, window = DE
             : (old.verdict === 'missing' ? 'notFound' : old.verdict));
         textVerdict = { verdict: old.verdict, state: mapped, nearestSeq: old.nearestSeq, distance: old.distance, quote: null };
       }
-      const dateVerdict = checkDate({ refDate: ref.date, event: eventNearSeq(events, ref.seq) });
       verdicts.push({ ...base, ...textVerdict, claimId: resolvedClaimId, textTrace, dateVerdict: dateVerdict.verdict, eventDate: dateVerdict.eventDate });
     }
     const count = (pred) => verdicts.filter(pred).length;
+    // T3：豁免必须**自证**（留样的 `pointerCount` / `tier` 来自产出 `section` 的**同一张卡对象**）：
+    //   ① 声明了 `pointerCount` ⇒ 必须等于本卡解析出的指针行数（多一条少一条都是判据坏了 ⇒ 红）；
+    //   ② 卡片级 `tier` 与解析结果必须一致（`pointers` ⇔ 每一行都是指针；`content` ⇔ 至少一行有正文）⇒ 红；
+    //   ③ **没有** `pointerCount` 的留样（离线重抽路径 `scripts/a6-text-level.mjs` 自己造行，不带该字段）
+    //      ⇒ 记 `pointerUnverified`（**信息项**，不红）：正文判据（①）仍然生效，
+    //      "这张卡有几条指针行"由造行者从 `card.pointerCount` 自证；不拿"缺字段"冒充"判据通过"。
+    // 为什么 ③ 不 fail-closed：那是**造行方的字段缺失**，不是卡坏了；把离线路径判红换不来任何召回，
+    // 只会制造一条没人能修的假红（与 T239「unreadable 不冒充 missing」同一条纪律：**未知 ≠ 已失效**）。
+    // `--no-text` 时文字层整层跳过（不解析指针），三项都不做（与"文字层已跳过"同口径）。
+    const pointerLines = textCheck ? count((v) => v.state === 'pointer') : 0;
+    const declaredPointer = typeof row?.pointerCount === 'number' && Number.isFinite(row.pointerCount) ? Number(row.pointerCount) : null;
+    const declaredTier = typeof row?.tier === 'string' ? row.tier : null;
+    const allPointers = verdicts.length > 0 && pointerLines === verdicts.length;
+    const pointerMismatch = textCheck && declaredPointer !== null && pointerLines > 0 && declaredPointer !== pointerLines;
+    const pointerUnverified = textCheck && declaredPointer === null && pointerLines > 0;
+    const tierMismatch = textCheck && (declaredTier === 'pointers' ? !allPointers : (declaredTier === 'content' ? allPointers : false));
     details.push({
       at: row.at,
       digest: row.digest,
@@ -303,6 +351,11 @@ export async function auditRows({ rows, episodes, loadEvents = null, window = DE
       textMissing: count((v) => v.state === 'notFound'), // 旧键 = notFound（true 坏引用）
       textUnreadable: count((v) => v.state === 'unreadable'),
       textUnresolved: count((v) => v.state === 'unresolved'),
+      // T3：指针行（正文未给）—— 单独计数，不进 A6 分子分母；`*Mismatch` 是自证失败（红）
+      textPointer: pointerLines,
+      pointerMismatch,
+      pointerUnverified,
+      tierMismatch,
       textJoined: count((v) => v.verdict === 'joined'),
       // 信息项（不参与 A6）：渲染正文的旧检查
       traceOk: count((v) => v.textTrace === 'at-seq'),
@@ -322,8 +375,12 @@ export async function auditRows({ rows, episodes, loadEvents = null, window = DE
   // T239：A6 的分母 = 引用数 − 读不到的（unreadable 不进分子也不进分母）。
   const textUnreadable = sum('textUnreadable');
   const textUnresolved = sum('textUnresolved');
-  // T243：unverified 类（读不到 / 反查不到）都不进 A6 分子分母
-  const a6Denominator = totalRefs - textUnreadable - textUnresolved;
+  // T3：指针行同样**没得核**（正文未给是设计，不是坏引用）⇒ 与 unreadable/unresolved 一样两头都不计。
+  const textPointer = sum('textPointer');
+  const pointerMismatchCards = details.filter((d) => d.pointerMismatch || d.tierMismatch).length;
+  const pointerUnverifiedCards = details.filter((d) => d.pointerUnverified).length;
+  // T243：unverified 类（读不到 / 反查不到 / 只有指针）都不进 A6 分子分母
+  const a6Denominator = totalRefs - textUnreadable - textUnresolved - textPointer;
   // 中位距离：只统计"偏移命中"（offset）的那批；偶数个取中间两个的均值。
   const offsetDistances = details
     .flatMap((d) => d.verdicts)
@@ -353,6 +410,10 @@ export async function auditRows({ rows, episodes, loadEvents = null, window = DE
     textMissing: sum('textMissing'), // = textNotFound（真找不到）
     textUnreadable,
     textUnresolved,
+    // T3：指针行（正文未给，设计如此）—— 单列 + 自证失败/未自证计数；都不进 A6 分子分母（指针另有自证闸）
+    textPointer,
+    pointerMismatchCards,
+    pointerUnverifiedCards,
     a6Mode: mode,
     textJoined: sum('textJoined'),
     // 信息项：旧口径（渲染正文）在同一批样本上的读数，便于对照
@@ -372,9 +433,10 @@ export async function auditRows({ rows, episodes, loadEvents = null, window = DE
     //   · notFound（真坏引用）> 0 ⇒ 红；
     //   · unreadable（核不了）> 0 ⇒ 红 —— fail-closed：一次"全读不到"的审计必须是红的，否则就是没验过也报绿；
     //   · offset（指针偏了）**不红**，只在汇总里单列 + 给占比（待修项）；
-    //   · 日期不一致 ⇒ 红；--no-text 退回旧口径。
+    //   · 日期不一致 ⇒ 红；--no-text 退回旧口径；
+    //   · T3：指针行（`isPointerBody`）**不红**（正文未给是设计），但它的**自证**对不上 ⇒ 红（fail-closed）。
     exitCode: textCheckFailed
-      ? ((sum('textNotFound') > 0 || textUnreadable > 0 || textUnresolved > 0 || sum('dateBad') > 0) ? 1 : 0)
+      ? ((sum('textNotFound') > 0 || textUnreadable > 0 || textUnresolved > 0 || sum('dateBad') > 0 || pointerMismatchCards > 0) ? 1 : 0)
       : (okRefs === totalRefs ? 0 : 1),
   };
 }
@@ -468,9 +530,9 @@ async function main(argv = process.argv.slice(2)) {
     if (textCheck) {
       // T239：四态分列（ok / offset / unreadable / notFound）+ 中位距离 + 占比
       const ratio = (n) => (out.a6Denominator ? `${((n / out.a6Denominator) * 100).toFixed(1)}%` : '-');
-      console.log(`样本 ${out.samples} 张 · 引用 ${out.refs} 条 · A6 分母 ${out.a6Denominator}（= 引用 − unreadable ${out.textUnreadable}）`);
-      console.log(`  ok ${out.textOk} · offset ${out.textOffset}（近 ${out.textOffsetNear} / 远 ${out.textOffsetFar}，占比 ${ratio(out.textOffset)}，中位距离 ${out.offsetDistanceMedian ?? 'n/a'}）· unreadable ${out.textUnreadable} · notFound ${out.textNotFound}（真找不到，占比 ${ratio(out.textNotFound)}）· unresolved ${out.textUnresolved} · 日期一致 ${out.dateOk}/${out.refs}${pidNote ? ' ' + pidNote : ''}`);
-      console.log(`  A6 口径：${out.a6Mode === 'quote' ? `support.quote（±${QUOTE_WINDOW}，NBSP/CRLF 归一）` : '渲染正文（旧口径）'} · 分母 ${out.a6Denominator} = 引用 − unreadable ${out.textUnreadable} − unresolved ${out.textUnresolved}`);
+      console.log(`样本 ${out.samples} 张 · 引用 ${out.refs} 条 · A6 分母 ${out.a6Denominator}（= 引用 − unreadable ${out.textUnreadable} − unresolved ${out.textUnresolved} − 指针 ${out.textPointer}）`);
+      console.log(`  ok ${out.textOk} · offset ${out.textOffset}（近 ${out.textOffsetNear} / 远 ${out.textOffsetFar}，占比 ${ratio(out.textOffset)}，中位距离 ${out.offsetDistanceMedian ?? 'n/a'}）· unreadable ${out.textUnreadable} · notFound ${out.textNotFound}（真找不到，占比 ${ratio(out.textNotFound)}）· unresolved ${out.textUnresolved} · 指针 ${out.textPointer}（正文未给，不计入 A6）· 日期一致 ${out.dateOk}/${out.refs}${pidNote ? ' ' + pidNote : ''}`);
+      console.log(`  A6 口径：${out.a6Mode === 'quote' ? `support.quote（±${QUOTE_WINDOW}，NBSP/CRLF 归一）` : '渲染正文（旧口径）'} · 分母 ${out.a6Denominator} = 引用 − unreadable ${out.textUnreadable} − unresolved ${out.textUnresolved} − 指针 ${out.textPointer}${out.pointerMismatchCards ? ` · **指针自证失败 ${out.pointerMismatchCards} 张**（pointerCount/tier 与解析结果对不上）` : ''}${out.pointerUnverifiedCards ? ` · 指针未自证 ${out.pointerUnverifiedCards} 张（留样没有 pointerCount：离线重抽路径）` : ''}`);
       console.log(`  对照（信息项，不参与 A6）：渲染正文口径 ok ${out.traceOk} · offset ${out.traceOffset} · notFound ${out.traceNotFound}`);
       console.log(`（引用层：可回溯 ${out.okRefs}/${out.refs}（${pct(out.okRefs)}，弱判据）· 同作用域 ${out.sameScopeRefs} · 跨作用域 ${out.crossScopeRefs} · window=±${out.window}）`);
       const gap = out.details.flatMap((d) => d.verdicts)
@@ -483,7 +545,7 @@ async function main(argv = process.argv.slice(2)) {
     }
     for (const d of out.details) {
       const extra = textCheck
-        ? ` ok=${d.textOk} offset=${d.textOffset} unreadable=${d.textUnreadable} notFound=${d.textNotFound} unresolved=${d.textUnresolved} 日期ok=${d.dateOk}/${d.refs}`
+        ? ` ok=${d.textOk} offset=${d.textOffset} unreadable=${d.textUnreadable} notFound=${d.textNotFound} unresolved=${d.textUnresolved} pointer=${d.textPointer} 日期ok=${d.dateOk}/${d.refs}`
         : '';
       console.log(`- ${new Date(d.at).toLocaleString()} ${String(d.scope).slice(-24)} tokens=${d.tokens} refs=${d.refs} ok=${d.ok}${extra}`);
     }

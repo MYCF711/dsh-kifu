@@ -47,6 +47,7 @@ import { fileURLToPath } from 'node:url';
 import { hasRelevantClaim, hasReliableHandle } from './rooms/abstain.mjs';
 
 import {
+  POINTER_TIER_DEFAULT,
   buildMemoryCard,
   defaultShadowDir,
   filterHitsByScope,
@@ -103,6 +104,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   autoArchive: true,
   autoArchiveMinutes: 30,
   crossScopeClass: false,
+  // T3（三级交付）：**没把握 ⇒ 只给指针**（`observed` 且支撑 ≤ `POINTER_SUPPORT_LIMIT`）。
+  // 默认值 = `POINTER_TIER_DEFAULT`（单一来源，与 `buildMemoryCard` / `collectEntries` 的默认参数同一份），
+  // 不再各自写一个字面量 —— 否则"函数默认关、插件默认开"会静默分叉。
+  // `false` 可显式关掉（回到 0.8.46 行为，向后兼容；A/B 对照也走它）。
+  pointerTier: POINTER_TIER_DEFAULT,
   // Q19 预置（2026-11-03）：true = 只注入 hard 约束，丢弃 soft 偏好（理由句/闲聊）。默认关，等主人裁定。
   preferenceHardOnly: false,
   liveStats: true, // A3 心跳：每步一行 live-stats.jsonl（默认开；关掉不影响功能）
@@ -198,6 +204,9 @@ export function sanitizeConfig(raw = {}) {
     autoArchive: boolOf(src.autoArchive, true),
     autoArchiveMinutes: positiveInt(src.autoArchiveMinutes, 30, 24 * 60),
     crossScopeClass: boolOf(src.crossScopeClass, false),
+    // T3：三级交付的第二级开关。**显式 false 才关**（`boolOf` 兜底 = DEFAULT_CONFIG 的值），
+    // 不用 `!== false` —— 那会把「未设置」当成「开启」，与 D5 踩过的坑同一个形状。
+    pointerTier: boolOf(src.pointerTier, DEFAULT_CONFIG.pointerTier),
     preferenceHardOnly: boolOf(src.preferenceHardOnly, false),
     liveStats: boolOf(src.liveStats, true),
     repeatHint: boolOf(src.repeatHint, true),
@@ -707,6 +716,9 @@ async function decidePreStep({ ctx, config, deps, payload, decision, lifecycle }
     droppedUnknownScope: scoped.droppedUnknown,
     // T332：`cost: 0` 降级门（索引缺失 ⇒ null ⇒ 不过滤）
     costIndex,
+    // T3：**三级交付接生产** —— 这一行是唯一接线点（删掉它，配置键就不再生效，T3 ⑩ 会红）。
+    // `true` ⇒ 没把握的条目只给指针（`episode + seq + occurredAt`），正文不渲染。
+    pointerTier: config.pointerTier === true,
   });
   // 闸 3 真核验：只核**这张卡里出现的**条目（≤ limit 条），够用且不会每步扫全库。
   // 每条按它自己的 scopeKey 解析工作区（probeValidity 内部做），失败只记 reason、绝不抛。
@@ -920,6 +932,7 @@ export const Config = {
     budgetTokens: { type: 'number', meta: { default: 500, description: '每次注入的 token 预算' } },
     limit: { type: 'number', meta: { default: 5, description: '每次最多注入几条' } },
     oncePerSession: { type: 'boolean', meta: { default: true, description: '每会话只注入一次（首轮）' } },
+    pointerTier: { type: 'boolean', meta: { default: true, description: '三级交付：只有 1 局支撑（observed）的记忆只给指针（ep + seq + 日期），不给全文' } },
   },
   meta: { default: {} },
   toJSON() {
@@ -1152,7 +1165,7 @@ export function handleConfigRoute({ method = 'GET', body = null, profileConfig =
     if (trimmed !== '' && !/^[A-Za-z]:[\/]|^\//.test(trimmed)) return { status: 400, body: { error: 'storeRoot 必须是绝对路径或留空' } };
     next.storeRoot = trimmed;
   }
-  for (const key of ['enabled', 'shadow', 'autoBuild', 'oncePerSession']) {
+  for (const key of ['enabled', 'shadow', 'autoBuild', 'oncePerSession', 'pointerTier']) {
     if (patch[key] !== undefined) {
       if (typeof patch[key] !== 'boolean') return { status: 400, body: { error: `${key} must be a boolean` } };
       next[key] = patch[key];
@@ -1397,6 +1410,11 @@ export function apply(ctx, rawConfig = {}) {
             // 注意作用域：这里是**外层**（不是 decidePreStep 内部），没有局部 `text`；
             // 必须用同文件的 `lastUserText(payload?.messages)` 现取（它就是 decidePreStep 用的那一条）。
             signalPreview: String(lastUserText(payload?.messages) ?? '').slice(0, 160),
+            // T3：**指针行的自证字段** —— A6 文字层要把指针行排除出分子分母，
+            // 排除前必须能核对「这张卡本来有几条指针行」，否则豁免等于"静默跳过"。
+            // 两个字段都来自产出 `section` 的**同一张卡对象**（不是重新统计 section）。
+            tier: typeof result.card?.tier === 'string' ? result.card.tier : null,
+            pointerCount: Number.isFinite(result.card?.pointerCount) ? Number(result.card.pointerCount) : null,
           });
         }
         appendLiveStats(storeRootForStats, {

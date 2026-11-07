@@ -29,7 +29,13 @@ function makeStore(withF3, { when } = {}) {
   }]);
   store.putMany('claims', [{
     id: 'c-0000f301', kind: 'antipattern', text: QUOTE, scopeKey: SCOPE, threadIds: [], state: 'observed',
-    support: [{ episode: 'ep-aaaaaaa1', seq: 41, quote: QUOTE, occurredAt: T(21) }],
+    // T3（三级交付）：**有把握 = 支撑 ≥ 2 局**。只有 1 局支撑的 `observed` 记在三级交付里**只给指针**
+    // （正文不渲染、也不带 F3 尾注）—— 本文件测的是 F3 的渲染与解析，必须用「有把握」的夹具，
+    // 否则测到的就不是 F3，而是"这一级现在归指针管"。
+    support: [
+      { episode: 'ep-aaaaaaa1', seq: 41, quote: QUOTE, occurredAt: T(21) },
+      { episode: 'ep-aaaaaaa1', seq: 40, quote: 'Error: another sighting of the same shape', occurredAt: T(21) },
+    ],
     counter: [], validity: { type: 'none', value: null }, preconditions: [],
     ...(withF3 ? { falsifiableWhen: { kind: 'text-pattern', rule: 'missing-module', when: when ?? `当模块 /d/ws/src/app.mjs 可被加载时不再成立`, quote: QUOTE } } : {}),
     occurredAt: T(21), recordedAt: T(21), validFrom: null, validTo: null,
